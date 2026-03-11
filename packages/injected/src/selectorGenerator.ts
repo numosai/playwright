@@ -477,6 +477,8 @@ function combineScores(tokens: SelectorToken[]): number {
 }
 
 function isGuidLike(id: string): boolean {
+  /* [numos:N-441] Detect framework-generated dynamic IDs (e.g. ember123) */
+  if (/^(ember|_ember)\d+$/.test(id)) return true;
   let lastCharacterType: 'lower' | 'upper' | 'digit' | 'other' | undefined;
   let transitionCount = 0;
   for (let i = 0; i < id.length; ++i) {

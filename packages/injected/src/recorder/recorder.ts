@@ -670,11 +670,14 @@ class RecordActionTool implements RecorderTool {
   }
 
   private _recordAction(action: actions.Action) {
+    try { this._enrichWithDomContext(action); } catch (_) { /* [numos:N-570] best-effort */ }
     void this._recorder.recordAction(action).then(() => this._reportPerformedActionForTests());
   }
 
   private _performAction(action: actions.PerformOnRecordAction) {
     this._recorder.updateHighlight(null, false);
+
+    try { this._enrichWithDomContext(action); } catch (_) { /* [numos:N-570] best-effort */ }
 
     this._performingActions.add(action);
 
@@ -683,6 +686,119 @@ class RecordActionTool implements RecorderTool {
       // If that was a keyboard action, it similarly requires new selectors for active model.
       this._onFocus(false);
     }).then(() => this._reportPerformedActionForTests());
+  }
+
+  private _enrichWithDomContext(action: actions.Action) {
+    /* [numos:N-570] Attach compact domContext for element disambiguation during replay.
+     *
+     * Captures three layers of structural context around the target element:
+     *
+     * 1. Target attrs — tag, id, name, placeholder, role, ariaLabel, type, etc.
+     * 2. Local parents (4 levels) — immediate structural context (tag, id, className, etc.)
+     * 3. Context anchor — the first "named" ancestor beyond the local parents, up to
+     *    depth 12. An ancestor qualifies as a context anchor if it has a strong identity
+     *    signal: id, testId, aria-label, title, or (role + text). This bridges the gap
+     *    when two elements share identical local structure but live under differently-
+     *    named sections (e.g. #admin_panel vs #basic_panel).
+     *
+     * At replay time, the scorer in engine.py compares each candidate's context against
+     * the stored context. The context anchor carries high weight (+10 for id match),
+     * making it the primary disambiguation signal for structurally identical elements.
+     */
+    const LOCAL_PARENT_DEPTH = 4;
+    const MAX_CONTEXT_ANCHOR_DEPTH = 12;
+    const element = (this._activeModel?.elements[0] ?? this._hoveredModel?.elements[0]) as HTMLElement | undefined;
+    if (!element)
+      return;
+
+    const target: Record<string, any> = { tag: element.tagName.toLowerCase() };
+    const testIdAttributeName = this._recorder.state.testIdAttributeName;
+    const targetText = (element.textContent || '').trim();
+    if (element.id) target.id = element.id;
+    if (element.getAttribute('name')) target.name = element.getAttribute('name')!;
+    if (element.getAttribute('placeholder')) target.placeholder = element.getAttribute('placeholder')!;
+    if (element.getAttribute('role')) target.role = element.getAttribute('role')!;
+    if (element.getAttribute('aria-label')) target.ariaLabel = element.getAttribute('aria-label')!;
+    if (element.getAttribute('type')) target.type = element.getAttribute('type')!;
+    if (testIdAttributeName) target.testIdAttributeName = testIdAttributeName;
+    if (testIdAttributeName && element.getAttribute(testIdAttributeName)) target.testId = element.getAttribute(testIdAttributeName)!;
+    if (element.getAttribute('title')) target.title = element.getAttribute('title')!;
+    if (element.getAttribute('href')) target.href = element.getAttribute('href')!;
+    if (targetText) target.text = targetText.substring(0, 80);
+    if (element.parentElement) target.childIndex = Array.prototype.indexOf.call(element.parentElement.children, element);
+    if (element.className && typeof element.className === 'string') target.className = element.className;
+
+    const buildContextAnchor = (node: HTMLElement, depth: number): Record<string, any> | null => {
+      const anchor: Record<string, any> = { tag: node.tagName.toLowerCase(), depth };
+      const anchorText = (node.textContent || '').trim();
+      if (node.id) anchor.id = node.id;
+      if (testIdAttributeName && node.getAttribute(testIdAttributeName)) anchor.testId = node.getAttribute(testIdAttributeName)!;
+      if (node.getAttribute('role')) anchor.role = node.getAttribute('role')!;
+      if (node.getAttribute('aria-label')) anchor.ariaLabel = node.getAttribute('aria-label')!;
+      if (node.getAttribute('title')) anchor.title = node.getAttribute('title')!;
+      if (anchorText && anchorText.length <= 80) anchor.text = anchorText;
+      if (node.className && typeof node.className === 'string') anchor.className = node.className;
+
+      if (anchor.id || anchor.testId || anchor.ariaLabel || anchor.title)
+        return anchor;
+      if (anchor.role && anchor.text)
+        return anchor;
+      return null;
+    };
+
+    const parents: Record<string, any>[] = [];
+    let node = element.parentElement;
+    for (let i = 0; i < LOCAL_PARENT_DEPTH && node && node !== this._recorder.document.body; i++) {
+      const p: Record<string, any> = { tag: node.tagName.toLowerCase() };
+      const parentText = (node.textContent || '').trim();
+      if (node.id) p.id = node.id;
+      if (node.className && typeof node.className === 'string') p.className = node.className;
+      if (node.getAttribute('role')) p.role = node.getAttribute('role')!;
+      if (testIdAttributeName && node.getAttribute(testIdAttributeName)) p.testId = node.getAttribute(testIdAttributeName)!;
+      if (node.getAttribute('title')) p.title = node.getAttribute('title')!;
+      if (node.getAttribute('href')) p.href = node.getAttribute('href')!;
+      if (parentText) p.text = parentText.substring(0, 80);
+      if (node.parentElement) p.childIndex = Array.prototype.indexOf.call(node.parentElement.children, node);
+      parents.push(p);
+      node = node.parentElement;
+    }
+
+    let contextAnchor: Record<string, any> | undefined;
+    let anchorNode = node;
+    let anchorDepth = LOCAL_PARENT_DEPTH + 1;
+    while (anchorNode && anchorNode !== this._recorder.document.body && anchorDepth <= MAX_CONTEXT_ANCHOR_DEPTH) {
+      const anchor = buildContextAnchor(anchorNode, anchorDepth);
+      if (anchor) {
+        contextAnchor = anchor;
+        break;
+      }
+      anchorNode = anchorNode.parentElement;
+      anchorDepth += 1;
+    }
+
+    const siblings: Record<string, string>[] = [];
+    let sib = element.previousElementSibling as HTMLElement | null;
+    for (let i = 0; i < 3 && sib; i++) {
+      const s: Record<string, string> = { tag: sib.tagName.toLowerCase(), position: 'before' };
+      const text = (sib.textContent || '').trim();
+      if (text) s.text = text.substring(0, 80);
+      if (sib.id) s.id = sib.id;
+      if (sib.getAttribute('role')) s.role = sib.getAttribute('role')!;
+      siblings.unshift(s);
+      sib = sib.previousElementSibling as HTMLElement | null;
+    }
+    sib = element.nextElementSibling as HTMLElement | null;
+    for (let i = 0; i < 3 && sib; i++) {
+      const s: Record<string, string> = { tag: sib.tagName.toLowerCase(), position: 'after' };
+      const text = (sib.textContent || '').trim();
+      if (text) s.text = text.substring(0, 80);
+      if (sib.id) s.id = sib.id;
+      if (sib.getAttribute('role')) s.role = sib.getAttribute('role')!;
+      siblings.push(s);
+      sib = sib.nextElementSibling as HTMLElement | null;
+    }
+
+    (action as any).domContext = { ...target, parents, siblings, ...(contextAnchor && { contextAnchor }) };
   }
 
   private _shouldGenerateKeyPressFor(event: KeyboardEvent): boolean {
@@ -735,8 +851,9 @@ class RecordActionTool implements RecorderTool {
   }
 
   private _updateHighlight(userGesture: boolean) {
-    this._recorder.updateHighlight(this._hoveredModel, userGesture);
+    /* [numos] Disable hover highlight in API mode */
   }
+
 }
 
 class JsonRecordActionTool implements RecorderTool {
@@ -1396,7 +1513,7 @@ export class Recorder {
       'none': new NoneTool(),
       'standby': new NoneTool(),
       'inspecting': new InspectTool(this, false),
-      'recording': options?.recorderMode === 'api' ? new JsonRecordActionTool(this) : new RecordActionTool(this),
+      'recording': new RecordActionTool(this), /* [numos] Always use RecordActionTool for better selectors */
       'recording-inspecting': new InspectTool(this, false),
       'assertingText': new TextAssertionTool(this, 'text'),
       'assertingVisibility': new InspectTool(this, true),
@@ -1405,7 +1522,8 @@ export class Recorder {
     };
     this._currentTool = this._tools.none;
     this._currentTool.install?.();
-    if (injectedScript.window.top === injectedScript.window && !options?.hideToolbar) {
+    /* [numos] Hide toolbar overlay in API mode — not needed for headless recording */
+    if (injectedScript.window.top === injectedScript.window && !options?.hideToolbar && options?.recorderMode !== 'api') {
       this.overlay = new Overlay(this);
       this.overlay.setUIState(this.state);
     }

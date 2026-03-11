@@ -450,10 +450,18 @@ class RecordActionTool implements RecorderTool {
     }
 
     if (target.nodeName === 'SELECT') {
+      /* [numos:N-556] Regenerate selector for SELECT targets.
+       * Mouse events on <select> are ignored by _shouldIgnoreMouseEvent(),
+       * so _activeModel is never updated via hover — it points at whatever
+       * was focused before.  Generate a fresh selector from the actual target. */
       const selectElement = target as HTMLSelectElement;
+      const generated = this._recorder.injectedScript.generateSelector(selectElement, { testIdAttributeName: this._recorder.state.testIdAttributeName });
+      if (!generated?.selector)
+        return;
+      this._activeModel = { ...generated, color: HighlightColors.action };
       this._recordAction({
         name: 'select',
-        selector: this._activeModel!.selector,
+        selector: generated.selector,
         options: [...selectElement.selectedOptions].map(option => option.value),
         signals: []
       });

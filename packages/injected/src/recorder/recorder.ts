@@ -1599,7 +1599,35 @@ export class Recorder {
   }
 
   setUIState(state: UIState, delegate: RecorderDelegate) {
-    this._delegate = delegate;
+    /* [numos] Blanket error guard: wrap every delegate method so exceptions
+       and rejected promises are reported instead of silently crashing the recorder.
+       Errors are sent to the Node.js bridge via __pw_recorderError binding. */
+    const reportError = (method: string, err: any) => {
+      const message = err instanceof Error ? err.message : String(err);
+      try {
+        (this.injectedScript.window as any).__pw_recorderError?.(method, message);
+      } catch (_) {
+        // Binding itself failed (e.g. CDP dead) — last resort
+        console.error(`[recorder] delegate.${method} error:`, message);
+      }
+    };
+    this._delegate = new Proxy(delegate, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== 'function')
+          return value;
+        return (...args: any[]) => {
+          try {
+            const result = value.apply(target, args);
+            if (result && typeof result.catch === 'function')
+              return result.catch((err: any) => reportError(String(prop), err));
+            return result;
+          } catch (err) {
+            reportError(String(prop), err);
+          }
+        };
+      },
+    });
 
     if (state.actionPoint && this.state.actionPoint && state.actionPoint.x === this.state.actionPoint.x && state.actionPoint.y === this.state.actionPoint.y) {
       // All good.
